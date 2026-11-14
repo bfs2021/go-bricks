@@ -46,6 +46,7 @@ const (
 	CodePayloadUndecodable   = "SEAL_PAYLOAD_UNDECODABLE"
 	CodeAuthorshipMismatch   = "SEAL_AUTHORSHIP_MISMATCH"
 	CodeDecryptFailed        = "SEAL_DECRYPT_FAILED"
+	CodeKeyResolutionFailed  = "SEAL_KEY_RESOLUTION_FAILED"
 )
 
 // Detail keys an OpenError may carry. Values are presence, length and layer only — never
@@ -247,7 +248,7 @@ func Verify(body []byte, spec *Spec, opts *OpenOptions) (*Envelope, error) {
 		return nil, err
 	}
 	if key, keyErr := opts.Keys.PublicKey(core.env.EncKid); keyErr != nil || key == nil {
-		return nil, unknownGenerationError(10, core.env.EncKid, tagKeyEncrypt, provisionedInKeySet, keyErr, layerJWE)
+		return nil, keyMissingError(10, core.env.EncKid, tagKeyEncrypt, provisionedInKeySet, keyErr, layerJWE)
 	}
 	return core.env, nil
 }
@@ -388,7 +389,7 @@ func peekOuter(compact string, spec *Spec, keys bricksjose.KeyResolver, where st
 	}
 	key, keyErr := keys.PublicKey(peek.Kid)
 	if keyErr != nil || key == nil {
-		return "", "", nil, unknownGenerationError(4, peek.Kid, tagKeySign, where, keyErr, "")
+		return "", "", nil, keyMissingError(4, peek.Kid, tagKeySign, where, keyErr, "")
 	}
 	return peek.Kid, family, key, nil
 }
@@ -568,7 +569,7 @@ func checkSubjectHeader(compact, outerKid string, spec *Spec) (cryptoadapter.Hea
 func decryptSubject(compact, kid string, keys bricksjose.KeyResolver) ([]byte, error) {
 	encKey, keyErr := keys.PrivateKey(kid)
 	if keyErr != nil || encKey == nil {
-		return nil, unknownGenerationError(10, kid, tagKeyEncrypt, provisionedOnConsumer, keyErr, layerJWE)
+		return nil, keyMissingError(10, kid, tagKeyEncrypt, provisionedOnConsumer, keyErr, layerJWE)
 	}
 	plaintext, _, err := cryptoadapter.Decrypt(compact, encKey, &cryptoadapter.DecryptOptions{
 		ExpectedKid: kid, AllowedKeyAlgs: openKeyAlgs, AllowedContentEnc: openContents,
@@ -592,6 +593,26 @@ const (
 	provisionedOnConsumer = "on this consumer"
 	provisionedInKeySet   = "in this key set"
 )
+
+// keyMissingError classifies a rule 4/10 resolution fault. Only the resolver's registered
+// ErrKidUnknown sentinel is the recoverable unknown-generation class; every other fault — a
+// nil keystore, a lookup timeout, or a resolver that returns (nil, nil) — is an infrastructure
+// failure, so it surfaces as the resolver's *jose.Error verbatim (or a synthesized one for the
+// broken (nil, nil) return) and is never mistaken for a generation that has not rolled out.
+func keyMissingError(rule int, kid, role, where string, cause error, layer string) error {
+	if errors.Is(cause, bricksjose.ErrKidUnknown) {
+		return unknownGenerationError(rule, kid, role, where, cause, layer)
+	}
+	if cause != nil {
+		return cause
+	}
+	return &bricksjose.Error{
+		Sentinel: bricksjose.ErrKeyResolution,
+		Code:     CodeKeyResolutionFailed,
+		Message:  fmt.Sprintf("%s resolver returned no key and no error", role),
+		Kid:      kid,
+	}
+}
 
 // unknownGenerationError is the recoverable class: a well-formed Generation the resolver has not provisioned.
 func unknownGenerationError(rule int, kid, role, where string, cause error, layer string) error {

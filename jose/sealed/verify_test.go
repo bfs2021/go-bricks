@@ -86,14 +86,25 @@ func TestVerifyResolvesTheEncryptKidAsPublic(t *testing.T) {
 	requireUnprovisionedEncryptRefusal(t, env, err)
 }
 
-func TestVerifyRefusesANilEncryptKey(t *testing.T) {
+// TestVerifyTreatsANilEncryptKeyAsInfrastructure pins that a (nil, nil) encrypt lookup is a
+// broken resolver, not a not-yet-provisioned generation (#2400).
+func TestVerifyTreatsANilEncryptKeyAsInfrastructure(t *testing.T) {
 	spec := testSpec(t)
 	wire, _, err := sealed.Seal(sampleEvent(), spec, testOptions(t))
 	require.NoError(t, err)
 	opts := &sealed.OpenOptions{EventType: eventType, Keys: nilKeyResolver{keys: publicOnlyResolver{t: t, keys: testKeys(t).resolver}, nilPublic: encKid}}
 
 	env, err := sealed.Verify(wire, spec, opts)
-	requireUnprovisionedEncryptRefusal(t, env, err)
+	assert.Nil(t, env)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, sealed.ErrKidUnknownGeneration)
+	var oe *sealed.OpenError
+	require.False(t, errors.As(err, &oe), "not a message refusal")
+	var je *bricksjose.Error
+	require.ErrorAs(t, err, &je)
+	assert.Equal(t, sealed.CodeKeyResolutionFailed, je.Code)
+	assert.Equal(t, encKid, je.Kid)
+	assert.ErrorIs(t, err, bricksjose.ErrKeyResolution)
 }
 
 func TestOpenKeepsTheConsumerWordingForAnUnprovisionedEncryptKey(t *testing.T) {
@@ -117,8 +128,10 @@ func TestOpenKeepsTheConsumerWordingForAnUnprovisionedEncryptKey(t *testing.T) {
 	assert.Equal(t, want, oe.Err.Message)
 }
 
-// TestEveryKeyLookupRefusesANilKeyLikeAMissingOne pins, per door reaching each lookup, one refusal for a failed and a (nil, nil) lookup.
-func TestEveryKeyLookupRefusesANilKeyLikeAMissingOne(t *testing.T) {
+// TestKeyLookupRefusalsSplitUnknownKidFromResolutionFaults pins, per door reaching each lookup,
+// that a resolver's ErrKidUnknown is the recoverable unknown-generation refusal while a broken
+// (nil, nil) lookup is an infrastructure fault, never a refusal of the message (#2400).
+func TestKeyLookupRefusalsSplitUnknownKidFromResolutionFaults(t *testing.T) {
 	spec := testSpec(t)
 	wire, _, err := sealed.Seal(sampleEvent(), spec, testOptions(t))
 	require.NoError(t, err)
@@ -174,21 +187,30 @@ func TestEveryKeyLookupRefusesANilKeyLikeAMissingOne(t *testing.T) {
 		},
 	}
 	for _, lk := range lookups {
-		shapes := map[string]bricksjose.KeyResolver{"missing": lk.missing, "nil": lk.nilKey}
-		for shape, keys := range shapes {
-			for door, msg := range lk.messages {
-				t.Run(lk.name+"/"+shape+"/"+door, func(t *testing.T) {
-					err := doors[door](&sealed.OpenOptions{EventType: eventType, Keys: keys})
-					var oe *sealed.OpenError
-					require.ErrorAs(t, err, &oe)
-					assert.Equal(t, sealed.CodeKidUnknownGeneration, oe.Err.Code)
-					assert.Equal(t, lk.rule, oe.Rule)
-					assert.Equal(t, lk.details, oe.Details)
-					assert.Equal(t, lk.kid, oe.Err.Kid)
-					assert.Equal(t, msg, oe.Err.Message)
-					assert.ErrorIs(t, err, sealed.ErrKidUnknownGeneration)
-				})
-			}
+		for door, msg := range lk.messages {
+			t.Run(lk.name+"/missing/"+door, func(t *testing.T) {
+				err := doors[door](&sealed.OpenOptions{EventType: eventType, Keys: lk.missing})
+				var oe *sealed.OpenError
+				require.ErrorAs(t, err, &oe)
+				assert.Equal(t, sealed.CodeKidUnknownGeneration, oe.Err.Code)
+				assert.Equal(t, lk.rule, oe.Rule)
+				assert.Equal(t, lk.details, oe.Details)
+				assert.Equal(t, lk.kid, oe.Err.Kid)
+				assert.Equal(t, msg, oe.Err.Message)
+				assert.ErrorIs(t, err, sealed.ErrKidUnknownGeneration)
+			})
+			t.Run(lk.name+"/nil_key/"+door, func(t *testing.T) {
+				err := doors[door](&sealed.OpenOptions{EventType: eventType, Keys: lk.nilKey})
+				require.Error(t, err)
+				assert.NotErrorIs(t, err, sealed.ErrKidUnknownGeneration)
+				var oe *sealed.OpenError
+				require.False(t, errors.As(err, &oe), "not a message refusal")
+				var je *bricksjose.Error
+				require.ErrorAs(t, err, &je)
+				assert.Equal(t, sealed.CodeKeyResolutionFailed, je.Code)
+				assert.Equal(t, lk.kid, je.Kid)
+				assert.ErrorIs(t, err, bricksjose.ErrKeyResolution)
+			})
 		}
 	}
 }

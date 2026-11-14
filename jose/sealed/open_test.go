@@ -1,6 +1,7 @@
 package sealed_test
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -985,4 +986,98 @@ func TestOpenResolvesTheEncryptKeyOnlyAfterTheFamilyPin(t *testing.T) {
 			})
 		}
 	}
+}
+
+// faultResolver fails every lookup with a fixed error; a nil error returns (nil, nil), which
+// breaks the KeyResolver contract without reporting why.
+type faultResolver struct{ err error }
+
+func (r faultResolver) PublicKey(string) (*rsa.PublicKey, error)   { return nil, r.err }
+func (r faultResolver) PrivateKey(string) (*rsa.PrivateKey, error) { return nil, r.err }
+
+// failingKidResolver fails lookups for one kid only, so a door reaches the encrypt resolution.
+type failingKidResolver struct {
+	keys bricksjose.KeyResolver
+	kid  string
+	err  error
+}
+
+func (r *failingKidResolver) PublicKey(kid string) (*rsa.PublicKey, error) {
+	if kid == r.kid {
+		return nil, r.err
+	}
+	return r.keys.PublicKey(kid)
+}
+
+func (r *failingKidResolver) PrivateKey(kid string) (*rsa.PrivateKey, error) {
+	if kid == r.kid {
+		return nil, r.err
+	}
+	return r.keys.PrivateKey(kid)
+}
+
+// TestOpenKeyResolutionFaultsAreInfrastructure pins the recoverable class to the resolver's
+// ErrKidUnknown sentinel (#2400): a nil keystore, a lookup timeout and a resolver returning
+// (nil, nil) are infrastructure faults — the message may be good — so they surface as the
+// resolver's error, never as ErrKidUnknownGeneration or a message refusal.
+func TestOpenKeyResolutionFaultsAreInfrastructure(t *testing.T) {
+	k := loadVectorKeys(t)
+	vf := loadVectors(t, k)
+	body := []byte(vf.Positive)
+	spec := testSpec(t)
+	var evt paymentAuthorized
+
+	opens := func(keys bricksjose.KeyResolver) error {
+		_, err := sealed.Open(body, spec, &sealed.OpenOptions{EventType: eventType, Keys: keys}, &evt)
+		return err
+	}
+	verifies := func(keys bricksjose.KeyResolver) error {
+		_, err := sealed.Verify(body, spec, &sealed.OpenOptions{EventType: eventType, Keys: keys})
+		return err
+	}
+	doors := map[string]func(bricksjose.KeyResolver) error{"open": opens, "verify": verifies}
+	assertInfrastructure := func(t *testing.T, err error) {
+		t.Helper()
+		require.Error(t, err)
+		require.NotErrorIs(t, err, sealed.ErrKidUnknownGeneration)
+		var oe *sealed.OpenError
+		require.False(t, errors.As(err, &oe), "not a message refusal")
+	}
+
+	t.Run("unknown_kid_stays_recoverable", func(t *testing.T) {
+		require.ErrorIs(t, opens(jositest.NewTestResolver(map[string]any{})), sealed.ErrKidUnknownGeneration)
+	})
+
+	t.Run("nil_keystore", func(t *testing.T) {
+		for name, call := range doors {
+			t.Run(name, func(t *testing.T) {
+				err := call(bricksjose.NewKeyStoreResolver(nil))
+				assertInfrastructure(t, err)
+				assert.ErrorIs(t, err, bricksjose.ErrKeyResolution)
+			})
+		}
+	})
+
+	t.Run("lookup_timeout", func(t *testing.T) {
+		err := opens(faultResolver{err: fmt.Errorf("resolver: %w", context.DeadlineExceeded)})
+		assertInfrastructure(t, err)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+	})
+
+	t.Run("nil_key_nil_error", func(t *testing.T) {
+		err := opens(faultResolver{})
+		assertInfrastructure(t, err)
+		assert.ErrorIs(t, err, bricksjose.ErrKeyResolution)
+	})
+
+	t.Run("encrypt_kid_fault", func(t *testing.T) {
+		keys := &failingKidResolver{keys: k.consumer, kid: vecEncKid, err: fmt.Errorf("resolver: %w", context.DeadlineExceeded)}
+		for name, call := range doors {
+			t.Run(name, func(t *testing.T) {
+				err := call(keys)
+				assertInfrastructure(t, err)
+				assert.ErrorIs(t, err, context.DeadlineExceeded)
+			})
+		}
+	})
 }
